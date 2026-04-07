@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import process from 'node:process';
 import { XMLParser } from 'fast-xml-parser';
 import * as cheerio from 'cheerio';
 
-const DEFAULT_CONCURRENCY = 4;
+const DEFAULT_CONCURRENCY = 1;
 const USER_AGENT = 'link-validator/1.0 (+https://piquant.ie)';
 const SOFT_404_PATTERNS = [
   /\b404\b/i,
@@ -24,7 +24,7 @@ const SOFT_404_PATTERNS = [
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  if (args.help || (!args.sitemap && !args.validateFrom)) {
+  if (args.help || !args.sitemap) {
     printHelp();
     process.exit(args.help ? 0 : 1);
   }
@@ -33,18 +33,6 @@ async function main() {
   const outDir = resolve(process.cwd(), args.outDir || '.');
 
   await mkdir(outDir, { recursive: true });
-
-  if (args.validateFrom) {
-    const inputFile = resolve(process.cwd(), args.validateFrom);
-    const report = await runValidationFromReport(inputFile, concurrency);
-    const outputFile = resolve(outDir, `${report.domain}-data-validation-results.md`);
-    await writeFile(outputFile, buildValidationMarkdownReport({
-      ...report,
-      generatedAt: new Date().toISOString(),
-    }), 'utf8');
-    console.log(`Done. Wrote validation results for ${report.uniqueUrlCount} unique URL(s) to ${outputFile}`);
-    return;
-  }
 
   const sitemapUrl = args.sitemap;
   const domain = getDomainFromUrl(sitemapUrl);
@@ -122,7 +110,6 @@ async function main() {
 function parseArgs(argv) {
   const args = {
     sitemap: '',
-    validateFrom: '',
     outDir: '.',
     concurrency: DEFAULT_CONCURRENCY,
     debug: false,
@@ -139,12 +126,6 @@ function parseArgs(argv) {
 
     if (arg === '--sitemap') {
       args.sitemap = argv[i + 1] || '';
-      i += 1;
-      continue;
-    }
-
-    if (arg === '--validate-from') {
-      args.validateFrom = argv[i + 1] || '';
       i += 1;
       continue;
     }
@@ -177,7 +158,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Usage:\n  node src/index.js --sitemap <url> [--out <dir>] [--concurrency <n>] [--debug [true|false]]\n  node src/index.js --validate-from <path-to-domain-data.md> [--out <dir>] [--concurrency <n>] [--debug [true|false]]\n\nExamples:\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports --debug true\n  node src/index.js --validate-from ./reports/piquant.ie-data.md --out ./reports`);
+  console.log(`Usage:\n  node src/index.js --sitemap <url> [--out <dir>] [--concurrency <n>] [--debug [true|false]]\n\nExamples:\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports --debug true`);
 }
 
 async function collectUrlsFromSitemap(sitemapUrl, visited = new Set()) {
@@ -575,271 +556,6 @@ function classifyNetworkError(error) {
   return 'connection_error';
 }
 
-async function runValidationFromReport(reportPath, concurrency) {
-  const markdown = await readFile(reportPath, 'utf8');
-  const domain = getDomainFromReportPathOrContent(reportPath, markdown);
-  const sitemapUrl = getSitemapFromMarkdown(markdown) || `https://${domain}/`;
-  const records = parseLinkRecordsFromMarkdown(markdown);
-
-  console.log(`Validating ${records.length} URL record(s) from ${reportPath}...`);
-  await validateRecords(records, sitemapUrl, concurrency);
-
-  const results = records.map((record) => ({
-    url: record.url,
-    resolvedUrl: record.resolvedUrl,
-    status: record.httpStatus,
-    ok: record.urlValidationStatus === 'valid' || record.urlValidationStatus === 'redirected_valid',
-    finalUrl: record.finalUrl,
-    validationStatus: record.urlValidationStatus,
-    validationNotes: record.validationNotes,
-    error: '',
-  }));
-
-  await writeFile(reportPath, buildMarkdownReport({
-    generatedAt: new Date().toISOString(),
-    sitemapUrl,
-    pageCount: countPagesFromMarkdown(markdown),
-    uniqueLinkCount: records.length,
-    records,
-    faultyTags: parseFaultyTagsFromMarkdown(markdown),
-    fetchErrors: parseFetchErrorsFromMarkdown(markdown),
-  }), 'utf8');
-
-  return {
-    domain,
-    sourceReport: reportPath,
-    uniqueUrlCount: results.length,
-    results,
-  };
-}
-
-function parseLinkRecordsFromMarkdown(markdown) {
-  const lines = markdown.split(/\r?\n/);
-  const records = [];
-  let currentRecord = null;
-  let currentSection = '';
-
-  for (const line of lines) {
-    if (line.startsWith('## ')) {
-      currentSection = line.trim();
-      continue;
-    }
-
-    if (currentSection !== '## Link Data') {
-      continue;
-    }
-
-    if (line.startsWith('### Link ')) {
-      if (currentRecord) {
-        records.push(currentRecord);
-      }
-      currentRecord = {
-        nameText: '',
-        url: '',
-        target: '',
-        parentUrl: '',
-        fullRawTag: '',
-        resolvedUrl: '',
-        urlValidationStatus: '',
-        finalUrl: '',
-        httpStatus: '',
-        validationNotes: '',
-      };
-      continue;
-    }
-
-    if (!currentRecord) {
-      continue;
-    }
-
-    if (line.startsWith('- Name/Text: ')) {
-      currentRecord.nameText = parseMarkdownValue(line.replace('- Name/Text: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- URL: ')) {
-      currentRecord.url = parseMarkdownValue(line.replace('- URL: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Target: ')) {
-      currentRecord.target = parseMarkdownValue(line.replace('- Target: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Parent URL: ')) {
-      currentRecord.parentUrl = parseMarkdownValue(line.replace('- Parent URL: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Resolved URL: ')) {
-      currentRecord.resolvedUrl = parseMarkdownValue(line.replace('- Resolved URL: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- URL Validation Status: ')) {
-      currentRecord.urlValidationStatus = parseMarkdownValue(line.replace('- URL Validation Status: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Final URL: ')) {
-      currentRecord.finalUrl = parseMarkdownValue(line.replace('- Final URL: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- HTTP Status: ')) {
-      currentRecord.httpStatus = parseMarkdownValue(line.replace('- HTTP Status: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Validation Notes: ')) {
-      currentRecord.validationNotes = parseMarkdownValue(line.replace('- Validation Notes: ', ''));
-      continue;
-    }
-  }
-
-  if (currentRecord) {
-    records.push(currentRecord);
-  }
-
-  return records;
-}
-
-function parseFaultyTagsFromMarkdown(markdown) {
-  const lines = markdown.split(/\r?\n/);
-  const records = [];
-  let currentRecord = null;
-  let currentSection = '';
-  let inCodeBlock = false;
-  let codeBuffer = [];
-
-  for (const line of lines) {
-    if (line.startsWith('## ')) {
-      currentSection = line.trim();
-      continue;
-    }
-
-    if (currentSection !== '## Faulty Tags') {
-      continue;
-    }
-
-    if (line.startsWith('### Faulty Tag ')) {
-      if (currentRecord) {
-        if (codeBuffer.length) {
-          currentRecord.rawTag = codeBuffer.join('\n');
-        }
-        records.push(currentRecord);
-      }
-      currentRecord = { parentUrl: '', issues: '', rawTag: '' };
-      inCodeBlock = false;
-      codeBuffer = [];
-      continue;
-    }
-
-    if (!currentRecord) {
-      continue;
-    }
-
-    if (line.startsWith('- Parent URL: ')) {
-      currentRecord.parentUrl = parseMarkdownValue(line.replace('- Parent URL: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Issues: ')) {
-      currentRecord.issues = parseMarkdownValue(line.replace('- Issues: ', ''));
-      continue;
-    }
-
-    if (line.trim() === '```html') {
-      inCodeBlock = true;
-      codeBuffer = [];
-      continue;
-    }
-
-    if (line.trim() === '```' && inCodeBlock) {
-      inCodeBlock = false;
-      currentRecord.rawTag = codeBuffer.join('\n');
-      continue;
-    }
-
-    if (inCodeBlock) {
-      codeBuffer.push(line);
-    }
-  }
-
-  if (currentRecord) {
-    if (codeBuffer.length) {
-      currentRecord.rawTag = codeBuffer.join('\n');
-    }
-    records.push(currentRecord);
-  }
-
-  return records;
-}
-
-function parseFetchErrorsFromMarkdown(markdown) {
-  const lines = markdown.split(/\r?\n/);
-  const records = [];
-  let currentRecord = null;
-  let currentSection = '';
-
-  for (const line of lines) {
-    if (line.startsWith('## ')) {
-      currentSection = line.trim();
-      continue;
-    }
-
-    if (currentSection !== '## Fetch Errors') {
-      continue;
-    }
-
-    if (line.startsWith('### Fetch Error ')) {
-      if (currentRecord) {
-        records.push(currentRecord);
-      }
-      currentRecord = { pageUrl: '', error: '' };
-      continue;
-    }
-
-    if (!currentRecord) {
-      continue;
-    }
-
-    if (line.startsWith('- Parent URL: ')) {
-      currentRecord.pageUrl = parseMarkdownValue(line.replace('- Parent URL: ', ''));
-      continue;
-    }
-
-    if (line.startsWith('- Error: ')) {
-      currentRecord.error = parseMarkdownValue(line.replace('- Error: ', ''));
-    }
-  }
-
-  if (currentRecord) {
-    records.push(currentRecord);
-  }
-
-  return records;
-}
-
-function countPagesFromMarkdown(markdown) {
-  const line = markdown.split(/\r?\n/).find((entry) => entry.startsWith('- Pages processed: '));
-  if (!line) {
-    return 0;
-  }
-
-  return Number.parseInt(line.replace('- Pages processed: ', '').trim(), 10) || 0;
-}
-
-function getSitemapFromMarkdown(markdown) {
-  const line = markdown.split(/\r?\n/).find((entry) => entry.startsWith('- Sitemap: '));
-  return line ? line.replace('- Sitemap: ', '').trim() : '';
-}
-
-function parseMarkdownValue(value) {
-  return value === '_empty_' ? '' : value.replace(/<br>/g, '\n');
-}
-
 function buildMarkdownReport({ generatedAt, sitemapUrl, pageCount, uniqueLinkCount, records, faultyTags, fetchErrors }) {
   const lines = [];
   const validationSummary = summarizeValidation(records);
@@ -934,44 +650,6 @@ function buildMarkdownReport({ generatedAt, sitemapUrl, pageCount, uniqueLinkCou
   return lines.join('\n');
 }
 
-function buildValidationMarkdownReport({ domain, sourceReport, uniqueUrlCount, results, generatedAt }) {
-  const lines = [];
-  const okCount = results.filter((result) => result.ok).length;
-  const failedCount = results.length - okCount;
-
-  lines.push('# Link Validation Results');
-  lines.push('');
-  lines.push(`- Report generated at: ${generatedAt || new Date().toISOString()}`);
-  lines.push(`- Domain: ${domain}`);
-  lines.push(`- Source report: ${sourceReport}`);
-  lines.push(`- Unique URLs checked: ${uniqueUrlCount}`);
-  lines.push(`- Successful responses: ${okCount}`);
-  lines.push(`- Failed responses: ${failedCount}`);
-  lines.push('');
-  lines.push('## Validation Results');
-  lines.push('');
-
-  if (!results.length) {
-    lines.push('_No URLs found in the source report._');
-    return lines.join('\n');
-  }
-
-  for (const [index, result] of results.entries()) {
-    lines.push(`### Validation ${index + 1}`);
-    lines.push('');
-    lines.push(`- URL: ${formatValue(result.url)}`);
-    lines.push(`- Resolved URL: ${formatValue(result.resolvedUrl)}`);
-    lines.push(`- URL Validation Status: ${formatValue(result.validationStatus)}`);
-    lines.push(`- HTTP Status: ${formatValue(result.status)}`);
-    lines.push(`- Final URL: ${formatValue(result.finalUrl)}`);
-    lines.push(`- Validation Notes: ${formatValue(result.validationNotes)}`);
-    lines.push(`- Error: ${formatValue(result.error)}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
 function summarizeValidation(records) {
   const statusCounts = {};
   const uniqueResolvedUrls = new Set();
@@ -1010,21 +688,6 @@ function formatValue(value) {
 function getDomainFromUrl(url) {
   const { hostname } = new URL(url);
   return hostname.replace(/^www\./, '');
-}
-
-function getDomainFromReportPathOrContent(reportPath, markdown) {
-  const fileNameMatch = reportPath.match(/([^/]+)-data\.md$/);
-  if (fileNameMatch) {
-    return fileNameMatch[1];
-  }
-
-  const sitemapLine = markdown.split(/\r?\n/).find((line) => line.startsWith('- Sitemap: '));
-  if (sitemapLine) {
-    const sitemapUrl = sitemapLine.replace('- Sitemap: ', '').trim();
-    return getDomainFromUrl(sitemapUrl);
-  }
-
-  throw new Error('Could not determine domain from report path or content.');
 }
 
 async function runWithConcurrency(items, concurrency, worker) {

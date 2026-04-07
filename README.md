@@ -25,23 +25,17 @@ npm install
 
 ## Run
 
-Create the extraction report:
+Generate the extraction report and validate extracted URLs in the same run:
 
 ```bash
 node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports
 ```
 
-Validate unique extracted URLs from an existing report:
-
-```bash
-node src/index.js --validate-from ./reports/piquant.ie-data.md --out ./reports
-```
-
 Optional flags:
 
-- `--concurrency 4`
+- `--concurrency 1` (default)
 - `--out ./reports`
-- `--debug true` → when extracting from a sitemap, only the first 30 page URLs are accumulated and processed
+- `--debug true` → only the first 30 sitemap page URLs are processed
 
 ## Output
 
@@ -59,13 +53,6 @@ The generated extraction markdown file contains:
 5. A `Faulty Tags` section with one record per issue
 6. A `Fetch Errors` section with one record per failed page
 
-The generated validation markdown file contains:
-
-1. Report metadata, including when the validation results were generated
-2. One validation record per unique absolute HTTP(S) URL
-3. HTTP status and status text
-4. Final URL after redirects
-5. Any fetch error if the validation request failed
 
 ## Validation statuses
 
