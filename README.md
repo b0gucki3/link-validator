@@ -21,8 +21,16 @@ npm install
 
 ## Run
 
+Create the extraction report:
+
 ```bash
 node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports
+```
+
+Validate unique extracted URLs from an existing report:
+
+```bash
+node src/index.js --validate-from ./reports/piquant.ie-data.md --out ./reports
 ```
 
 Optional flags:
@@ -32,11 +40,18 @@ Optional flags:
 
 ## Output
 
-The generated markdown file contains:
+The generated extraction markdown file contains:
 
 1. A `Link Data` section with one record per link
 2. A `Faulty Tags` section with one record per issue
 3. A `Fetch Errors` section with one record per failed page
+
+The generated validation markdown file contains:
+
+1. One validation record per unique absolute HTTP(S) URL
+2. HTTP status and status text
+3. Final URL after redirects
+4. Any fetch error if the validation request failed
 
 ## Notes
 
