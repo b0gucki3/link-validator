@@ -11,6 +11,10 @@ Sitemap-driven link extraction and validation utility.
 - Produces a markdown report named after the domain, for example `piquant.ie-data.md`
 - Uses a record-by-record markdown list format for better readability
 - Deduplicates records only when every stored field matches exactly
+- Automatically validates each extracted URL and appends validation fields into the same markdown report
+- Reuses validation results for duplicate resolved URLs so the same target is not fetched repeatedly
+- Resolves `/` and other root-relative URLs against the sitemap domain
+- Marks non-web schemes such as `mailto:`, `tel:`, `javascript:`, `sms:`, `data:`, and fragment-only URLs as `not_applicable`
 - Logs suspicious anchor tags and fetch failures in separate report sections
 
 ## Install
@@ -37,14 +41,22 @@ Optional flags:
 
 - `--concurrency 4`
 - `--out ./reports`
+- `--debug true` → when extracting from a sitemap, only the first 30 page URLs are accumulated and processed
 
 ## Output
 
 The generated extraction markdown file contains:
 
-1. A `Link Data` section with one record per link
-2. A `Faulty Tags` section with one record per issue
-3. A `Fetch Errors` section with one record per failed page
+1. A top-level validation summary with counts by status and unique resolved URLs checked
+2. A `Link Data` section with one record per link
+3. Per-link validation fields:
+   - `Resolved URL`
+   - `URL Validation Status`
+   - `Final URL`
+   - `HTTP Status`
+   - `Validation Notes`
+4. A `Faulty Tags` section with one record per issue
+5. A `Fetch Errors` section with one record per failed page
 
 The generated validation markdown file contains:
 
@@ -53,8 +65,26 @@ The generated validation markdown file contains:
 3. Final URL after redirects
 4. Any fetch error if the validation request failed
 
+## Validation statuses
+
+The in-report validation step can currently classify links as:
+
+- `valid`
+- `redirected_valid`
+- `not_found`
+- `soft_404`
+- `third_party_404`
+- `server_error`
+- `blocked`
+- `timeout`
+- `dns_error`
+- `connection_error`
+- `invalid_url`
+- `not_applicable`
+
 ## Notes
 
 - This version parses server-returned HTML, not a browser-rendered DOM.
 - HTML parsers often repair malformed markup, so faulty tag detection uses a raw-source heuristic pass.
 - `Full Raw Tag` is taken from the parsed anchor node serialization, which may differ slightly from original source on malformed HTML.
+- Validation uses HTTP requests with redirect following plus simple soft-404 heuristics based on response content.

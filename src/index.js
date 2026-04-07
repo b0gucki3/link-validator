@@ -8,6 +8,18 @@ import * as cheerio from 'cheerio';
 
 const DEFAULT_CONCURRENCY = 4;
 const USER_AGENT = 'link-validator/1.0 (+https://piquant.ie)';
+const SOFT_404_PATTERNS = [
+  /\b404\b/i,
+  /page not found/i,
+  /not found/i,
+  /does(?: not|n't) exist/i,
+  /no longer available/i,
+  /has been removed/i,
+  /content unavailable/i,
+  /listing (?:is )?unavailable/i,
+  /product unavailable/i,
+  /sorry[, ]+we can(?:not|'t) find/i,
+];
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -36,13 +48,19 @@ async function main() {
   const outputFile = resolve(outDir, `${domain}-data.md`);
 
   console.log(`Collecting URLs from sitemap: ${sitemapUrl}`);
-  const pageUrls = await collectUrlsFromSitemap(sitemapUrl);
+  const collectedPageUrls = await collectUrlsFromSitemap(sitemapUrl);
 
-  if (!pageUrls.length) {
+  if (!collectedPageUrls.length) {
     throw new Error('No page URLs were found in the sitemap.');
   }
 
-  console.log(`Found ${pageUrls.length} page URL(s). Processing with concurrency ${concurrency}...`);
+  const pageUrls = args.debug ? collectedPageUrls.slice(0, 30) : collectedPageUrls;
+
+  if (args.debug) {
+    console.log(`Debug mode enabled. Limiting sitemap page processing to the first ${pageUrls.length} URL(s).`);
+  }
+
+  console.log(`Found ${collectedPageUrls.length} page URL(s). Processing ${pageUrls.length} with concurrency ${concurrency}...`);
 
   const records = [];
   const faultyTags = [];
@@ -74,6 +92,9 @@ async function main() {
     }
   });
 
+  console.log(`Validating ${records.length} extracted link record(s)...`);
+  await validateRecords(records, sitemapUrl, concurrency);
+
   const markdown = buildMarkdownReport({
     sitemapUrl,
     pageCount: pageUrls.length,
@@ -100,6 +121,7 @@ function parseArgs(argv) {
     validateFrom: '',
     outDir: '.',
     concurrency: DEFAULT_CONCURRENCY,
+    debug: false,
     help: false,
   };
 
@@ -134,13 +156,24 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+
+    if (arg === '--debug') {
+      const value = (argv[i + 1] || '').toLowerCase();
+      if (value === 'true' || value === 'false') {
+        args.debug = value === 'true';
+        i += 1;
+      } else {
+        args.debug = true;
+      }
+      continue;
+    }
   }
 
   return args;
 }
 
 function printHelp() {
-  console.log(`Usage:\n  node src/index.js --sitemap <url> [--out <dir>] [--concurrency <n>]\n  node src/index.js --validate-from <path-to-domain-data.md> [--out <dir>] [--concurrency <n>]\n\nExamples:\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports\n  node src/index.js --validate-from ./reports/piquant.ie-data.md --out ./reports`);
+  console.log(`Usage:\n  node src/index.js --sitemap <url> [--out <dir>] [--concurrency <n>] [--debug [true|false]]\n  node src/index.js --validate-from <path-to-domain-data.md> [--out <dir>] [--concurrency <n>] [--debug [true|false]]\n\nExamples:\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports\n  node src/index.js --sitemap https://piquant.ie/sitemap.xml --out ./reports --debug true\n  node src/index.js --validate-from ./reports/piquant.ie-data.md --out ./reports`);
 }
 
 async function collectUrlsFromSitemap(sitemapUrl, visited = new Set()) {
@@ -198,21 +231,27 @@ async function fetchText(url) {
   return response.text();
 }
 
-async function validateUrl(url) {
+async function fetchValidationDetails(url) {
   const response = await fetch(url, {
     method: 'GET',
     headers: {
       'user-agent': USER_AGENT,
-      'accept': '*/*',
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7',
     },
     redirect: 'follow',
   });
+
+  const contentType = response.headers.get('content-type') || '';
+  const isHtml = /text\/html|application\/xhtml\+xml/i.test(contentType);
+  const body = isHtml ? await response.text() : '';
 
   return {
     ok: response.ok,
     status: response.status,
     statusText: response.statusText,
     finalUrl: response.url,
+    contentType,
+    body,
   };
 }
 
@@ -237,6 +276,11 @@ function extractLinksFromHtml(html, pageUrl) {
       target,
       parentUrl: pageUrl,
       fullRawTag: rawTag,
+      resolvedUrl: '',
+      urlValidationStatus: '',
+      finalUrl: '',
+      httpStatus: '',
+      validationNotes: '',
     });
   });
 
@@ -280,47 +324,286 @@ function detectFaultyAnchorTags(html, pageUrl) {
   return faulty;
 }
 
+async function validateRecords(records, sitemapUrl, concurrency) {
+  const prepared = records.map((record, index) => ({
+    record,
+    index,
+    normalizedInputUrl: String(record.url ?? '').trim(),
+    resolvedUrl: '',
+    preValidationResult: null,
+  }));
+
+  const cache = new Map();
+  const uniqueResolvedUrlsToValidate = [];
+
+  for (const item of prepared) {
+    const preflight = prepareValidationTarget(item.normalizedInputUrl, sitemapUrl);
+
+    if (preflight.immediateResult) {
+      item.preValidationResult = preflight.immediateResult;
+      continue;
+    }
+
+    item.resolvedUrl = preflight.resolvedUrl;
+
+    if (!cache.has(preflight.resolvedUrl)) {
+      cache.set(preflight.resolvedUrl, null);
+      uniqueResolvedUrlsToValidate.push(preflight.resolvedUrl);
+    }
+  }
+
+  console.log(`Prepared ${records.length} record(s) for validation; ${uniqueResolvedUrlsToValidate.length} unique URL(s) require network checks.`);
+
+  await runWithConcurrency(uniqueResolvedUrlsToValidate, concurrency, async (resolvedUrl, index) => {
+    console.log(`[validate ${index + 1}/${uniqueResolvedUrlsToValidate.length}] ${resolvedUrl}`);
+    const result = await validateResolvedUrl(resolvedUrl);
+    cache.set(resolvedUrl, result);
+  });
+
+  for (const item of prepared) {
+    const result = item.preValidationResult || cache.get(item.resolvedUrl) || {
+      resolvedUrl: item.resolvedUrl,
+      urlValidationStatus: 'connection_error',
+      finalUrl: '',
+      httpStatus: '',
+      validationNotes: 'Validation result missing from cache',
+    };
+
+    item.record.resolvedUrl = result.resolvedUrl;
+    item.record.urlValidationStatus = result.urlValidationStatus;
+    item.record.finalUrl = result.finalUrl;
+    item.record.httpStatus = result.httpStatus;
+    item.record.validationNotes = result.validationNotes;
+  }
+}
+
+function prepareValidationTarget(rawUrl, sitemapUrl) {
+  const trimmedUrl = String(rawUrl ?? '').trim();
+
+  if (!trimmedUrl) {
+    return {
+      resolvedUrl: '',
+      immediateResult: {
+        resolvedUrl: '',
+        urlValidationStatus: 'not_applicable',
+        finalUrl: '',
+        httpStatus: '',
+        validationNotes: 'Empty URL value',
+      },
+    };
+  }
+
+  if (trimmedUrl.startsWith('#')) {
+    return {
+      resolvedUrl: '',
+      immediateResult: {
+        resolvedUrl: '',
+        urlValidationStatus: 'not_applicable',
+        finalUrl: '',
+        httpStatus: '',
+        validationNotes: 'Fragment-only URL',
+      },
+    };
+  }
+
+  if (isNonWebScheme(trimmedUrl)) {
+    return {
+      resolvedUrl: '',
+      immediateResult: {
+        resolvedUrl: '',
+        urlValidationStatus: 'not_applicable',
+        finalUrl: '',
+        httpStatus: '',
+        validationNotes: `Non-web scheme: ${trimmedUrl.split(':', 1)[0]}`,
+      },
+    };
+  }
+
+  try {
+    return {
+      resolvedUrl: resolveCandidateUrl(trimmedUrl, sitemapUrl),
+      immediateResult: null,
+    };
+  } catch (error) {
+    return {
+      resolvedUrl: '',
+      immediateResult: {
+        resolvedUrl: '',
+        urlValidationStatus: 'invalid_url',
+        finalUrl: '',
+        httpStatus: '',
+        validationNotes: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+async function validateResolvedUrl(resolvedUrl) {
+  try {
+    const response = await fetchValidationDetails(resolvedUrl);
+    const classification = classifyValidationResult(response, resolvedUrl);
+
+    return {
+      resolvedUrl,
+      urlValidationStatus: classification.urlValidationStatus,
+      finalUrl: response.finalUrl,
+      httpStatus: String(response.status),
+      validationNotes: classification.validationNotes,
+    };
+  } catch (error) {
+    return {
+      resolvedUrl,
+      urlValidationStatus: classifyNetworkError(error),
+      finalUrl: '',
+      httpStatus: '',
+      validationNotes: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function classifyValidationResult(response, requestedUrl) {
+  const notes = [];
+  const finalUrl = response.finalUrl || '';
+  const redirected = finalUrl && finalUrl !== requestedUrl;
+  const soft404 = isSoft404(response.body, finalUrl || requestedUrl);
+  const externalTarget = isThirdPartyTarget(requestedUrl, finalUrl || requestedUrl);
+
+  if (redirected) {
+    notes.push(`Redirected to ${finalUrl}`);
+  }
+
+  if (response.status === 404 || response.status === 410) {
+    return {
+      urlValidationStatus: externalTarget ? 'third_party_404' : 'not_found',
+      validationNotes: notes.join('; '),
+    };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return {
+      urlValidationStatus: 'blocked',
+      validationNotes: notes.join('; '),
+    };
+  }
+
+  if (response.status >= 500) {
+    return {
+      urlValidationStatus: 'server_error',
+      validationNotes: notes.join('; '),
+    };
+  }
+
+  if (soft404) {
+    notes.push('Soft-404 pattern detected in response body');
+    return {
+      urlValidationStatus: externalTarget ? 'third_party_404' : 'soft_404',
+      validationNotes: notes.join('; '),
+    };
+  }
+
+  if (response.ok && redirected) {
+    return {
+      urlValidationStatus: 'redirected_valid',
+      validationNotes: notes.join('; '),
+    };
+  }
+
+  if (response.ok) {
+    return {
+      urlValidationStatus: 'valid',
+      validationNotes: notes.join('; '),
+    };
+  }
+
+  return {
+    urlValidationStatus: 'connection_error',
+    validationNotes: notes.join('; ') || `Unexpected HTTP status ${response.status}`,
+  };
+}
+
+function isSoft404(body, url) {
+  if (!body) {
+    return false;
+  }
+
+  const sample = body.slice(0, 20000);
+  return SOFT_404_PATTERNS.some((pattern) => pattern.test(sample)) || /\/404(?:\/|$)/i.test(url);
+}
+
+function isThirdPartyTarget(requestedUrl, finalUrl) {
+  try {
+    const requestedHost = new URL(requestedUrl).hostname.replace(/^www\./, '');
+    const finalHost = new URL(finalUrl).hostname.replace(/^www\./, '');
+    return requestedHost !== finalHost;
+  } catch {
+    return false;
+  }
+}
+
+function isNonWebScheme(value) {
+  return /^(mailto|tel|javascript|sms|data):/i.test(value);
+}
+
+function resolveCandidateUrl(value, sitemapUrl) {
+  if (value === '/' || value.startsWith('/')) {
+    return new URL(value, sitemapUrl).toString();
+  }
+
+  const parsed = new URL(value, sitemapUrl);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Unsupported URL protocol: ${parsed.protocol}`);
+  }
+
+  return parsed.toString();
+}
+
+function classifyNetworkError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (/timed? out/i.test(message)) {
+    return 'timeout';
+  }
+
+  if (/ENOTFOUND|DNS|domain name/i.test(message)) {
+    return 'dns_error';
+  }
+
+  return 'connection_error';
+}
+
 async function runValidationFromReport(reportPath, concurrency) {
   const markdown = await readFile(reportPath, 'utf8');
   const domain = getDomainFromReportPathOrContent(reportPath, markdown);
+  const sitemapUrl = getSitemapFromMarkdown(markdown) || `https://${domain}/`;
   const records = parseLinkRecordsFromMarkdown(markdown);
-  const candidates = records
-    .map((record) => record.url)
-    .filter((url) => isValidAbsoluteHttpUrl(url));
 
-  const uniqueUrls = [...new Set(candidates)];
-  const results = [];
+  console.log(`Validating ${records.length} URL record(s) from ${reportPath}...`);
+  await validateRecords(records, sitemapUrl, concurrency);
 
-  console.log(`Validating ${uniqueUrls.length} unique URL(s) from ${reportPath}...`);
+  const results = records.map((record) => ({
+    url: record.url,
+    resolvedUrl: record.resolvedUrl,
+    status: record.httpStatus,
+    ok: record.urlValidationStatus === 'valid' || record.urlValidationStatus === 'redirected_valid',
+    finalUrl: record.finalUrl,
+    validationStatus: record.urlValidationStatus,
+    validationNotes: record.validationNotes,
+    error: '',
+  }));
 
-  await runWithConcurrency(uniqueUrls, concurrency, async (url, index) => {
-    try {
-      console.log(`[${index + 1}/${uniqueUrls.length}] ${url}`);
-      const result = await validateUrl(url);
-      results.push({
-        url,
-        status: result.status,
-        statusText: result.statusText,
-        ok: result.ok,
-        finalUrl: result.finalUrl,
-        error: '',
-      });
-    } catch (error) {
-      results.push({
-        url,
-        status: '',
-        statusText: '',
-        ok: false,
-        finalUrl: '',
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
+  await writeFile(reportPath, buildMarkdownReport({
+    sitemapUrl,
+    pageCount: countPagesFromMarkdown(markdown),
+    uniqueLinkCount: records.length,
+    records,
+    faultyTags: parseFaultyTagsFromMarkdown(markdown),
+    fetchErrors: parseFetchErrorsFromMarkdown(markdown),
+  }), 'utf8');
 
   return {
     domain,
     sourceReport: reportPath,
-    uniqueUrlCount: uniqueUrls.length,
+    uniqueUrlCount: results.length,
     results,
   };
 }
@@ -350,6 +633,12 @@ function parseLinkRecordsFromMarkdown(markdown) {
         url: '',
         target: '',
         parentUrl: '',
+        fullRawTag: '',
+        resolvedUrl: '',
+        urlValidationStatus: '',
+        finalUrl: '',
+        httpStatus: '',
+        validationNotes: '',
       };
       continue;
     }
@@ -375,6 +664,32 @@ function parseLinkRecordsFromMarkdown(markdown) {
 
     if (line.startsWith('- Parent URL: ')) {
       currentRecord.parentUrl = parseMarkdownValue(line.replace('- Parent URL: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- Resolved URL: ')) {
+      currentRecord.resolvedUrl = parseMarkdownValue(line.replace('- Resolved URL: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- URL Validation Status: ')) {
+      currentRecord.urlValidationStatus = parseMarkdownValue(line.replace('- URL Validation Status: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- Final URL: ')) {
+      currentRecord.finalUrl = parseMarkdownValue(line.replace('- Final URL: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- HTTP Status: ')) {
+      currentRecord.httpStatus = parseMarkdownValue(line.replace('- HTTP Status: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- Validation Notes: ')) {
+      currentRecord.validationNotes = parseMarkdownValue(line.replace('- Validation Notes: ', ''));
+      continue;
     }
   }
 
@@ -385,20 +700,168 @@ function parseLinkRecordsFromMarkdown(markdown) {
   return records;
 }
 
+function parseFaultyTagsFromMarkdown(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const records = [];
+  let currentRecord = null;
+  let currentSection = '';
+  let inCodeBlock = false;
+  let codeBuffer = [];
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      currentSection = line.trim();
+      continue;
+    }
+
+    if (currentSection !== '## Faulty Tags') {
+      continue;
+    }
+
+    if (line.startsWith('### Faulty Tag ')) {
+      if (currentRecord) {
+        if (codeBuffer.length) {
+          currentRecord.rawTag = codeBuffer.join('\n');
+        }
+        records.push(currentRecord);
+      }
+      currentRecord = { parentUrl: '', issues: '', rawTag: '' };
+      inCodeBlock = false;
+      codeBuffer = [];
+      continue;
+    }
+
+    if (!currentRecord) {
+      continue;
+    }
+
+    if (line.startsWith('- Parent URL: ')) {
+      currentRecord.parentUrl = parseMarkdownValue(line.replace('- Parent URL: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- Issues: ')) {
+      currentRecord.issues = parseMarkdownValue(line.replace('- Issues: ', ''));
+      continue;
+    }
+
+    if (line.trim() === '```html') {
+      inCodeBlock = true;
+      codeBuffer = [];
+      continue;
+    }
+
+    if (line.trim() === '```' && inCodeBlock) {
+      inCodeBlock = false;
+      currentRecord.rawTag = codeBuffer.join('\n');
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeBuffer.push(line);
+    }
+  }
+
+  if (currentRecord) {
+    if (codeBuffer.length) {
+      currentRecord.rawTag = codeBuffer.join('\n');
+    }
+    records.push(currentRecord);
+  }
+
+  return records;
+}
+
+function parseFetchErrorsFromMarkdown(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const records = [];
+  let currentRecord = null;
+  let currentSection = '';
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      currentSection = line.trim();
+      continue;
+    }
+
+    if (currentSection !== '## Fetch Errors') {
+      continue;
+    }
+
+    if (line.startsWith('### Fetch Error ')) {
+      if (currentRecord) {
+        records.push(currentRecord);
+      }
+      currentRecord = { pageUrl: '', error: '' };
+      continue;
+    }
+
+    if (!currentRecord) {
+      continue;
+    }
+
+    if (line.startsWith('- Parent URL: ')) {
+      currentRecord.pageUrl = parseMarkdownValue(line.replace('- Parent URL: ', ''));
+      continue;
+    }
+
+    if (line.startsWith('- Error: ')) {
+      currentRecord.error = parseMarkdownValue(line.replace('- Error: ', ''));
+    }
+  }
+
+  if (currentRecord) {
+    records.push(currentRecord);
+  }
+
+  return records;
+}
+
+function countPagesFromMarkdown(markdown) {
+  const line = markdown.split(/\r?\n/).find((entry) => entry.startsWith('- Pages processed: '));
+  if (!line) {
+    return 0;
+  }
+
+  return Number.parseInt(line.replace('- Pages processed: ', '').trim(), 10) || 0;
+}
+
+function getSitemapFromMarkdown(markdown) {
+  const line = markdown.split(/\r?\n/).find((entry) => entry.startsWith('- Sitemap: '));
+  return line ? line.replace('- Sitemap: ', '').trim() : '';
+}
+
 function parseMarkdownValue(value) {
   return value === '_empty_' ? '' : value.replace(/<br>/g, '\n');
 }
 
 function buildMarkdownReport({ sitemapUrl, pageCount, uniqueLinkCount, records, faultyTags, fetchErrors }) {
   const lines = [];
+  const validationSummary = summarizeValidation(records);
 
   lines.push(`# Link Extraction Report`);
   lines.push('');
   lines.push(`- Sitemap: ${sitemapUrl}`);
   lines.push(`- Pages processed: ${pageCount}`);
   lines.push(`- Unique links: ${uniqueLinkCount}`);
+  lines.push(`- Unique resolved URLs validated: ${validationSummary.uniqueResolvedUrlCount}`);
+  lines.push(`- Validation-ready records: ${validationSummary.validationReadyRecordCount}`);
+  lines.push(`- Not applicable records: ${validationSummary.notApplicableRecordCount}`);
   lines.push(`- Faulty tag candidates: ${faultyTags.length}`);
   lines.push(`- Fetch errors: ${fetchErrors.length}`);
+  lines.push('');
+  lines.push('## Validation Summary');
+  lines.push('');
+
+  if (!validationSummary.totalRecords) {
+    lines.push('_No link records found._');
+  } else {
+    lines.push(`- Total records: ${validationSummary.totalRecords}`);
+    for (const [status, count] of Object.entries(validationSummary.statusCounts)) {
+      lines.push(`- ${status}: ${count}`);
+    }
+  }
+
   lines.push('');
   lines.push('## Link Data');
   lines.push('');
@@ -413,6 +876,11 @@ function buildMarkdownReport({ sitemapUrl, pageCount, uniqueLinkCount, records, 
       lines.push(`- URL: ${formatValue(record.url)}`);
       lines.push(`- Target: ${formatValue(record.target)}`);
       lines.push(`- Parent URL: ${formatValue(record.parentUrl)}`);
+      lines.push(`- Resolved URL: ${formatValue(record.resolvedUrl)}`);
+      lines.push(`- URL Validation Status: ${formatValue(record.urlValidationStatus)}`);
+      lines.push(`- Final URL: ${formatValue(record.finalUrl)}`);
+      lines.push(`- HTTP Status: ${formatValue(record.httpStatus)}`);
+      lines.push(`- Validation Notes: ${formatValue(record.validationNotes)}`);
       lines.push(`- Full Raw Tag:`);
       lines.push('');
       lines.push('```html');
@@ -477,7 +945,7 @@ function buildValidationMarkdownReport({ domain, sourceReport, uniqueUrlCount, r
   lines.push('');
 
   if (!results.length) {
-    lines.push('_No valid absolute HTTP(S) URLs found in the source report._');
+    lines.push('_No URLs found in the source report._');
     return lines.join('\n');
   }
 
@@ -485,15 +953,46 @@ function buildValidationMarkdownReport({ domain, sourceReport, uniqueUrlCount, r
     lines.push(`### Validation ${index + 1}`);
     lines.push('');
     lines.push(`- URL: ${formatValue(result.url)}`);
-    lines.push(`- OK: ${result.ok ? 'true' : 'false'}`);
-    lines.push(`- Status: ${formatValue(result.status)}`);
-    lines.push(`- Status Text: ${formatValue(result.statusText)}`);
+    lines.push(`- Resolved URL: ${formatValue(result.resolvedUrl)}`);
+    lines.push(`- URL Validation Status: ${formatValue(result.validationStatus)}`);
+    lines.push(`- HTTP Status: ${formatValue(result.status)}`);
     lines.push(`- Final URL: ${formatValue(result.finalUrl)}`);
+    lines.push(`- Validation Notes: ${formatValue(result.validationNotes)}`);
     lines.push(`- Error: ${formatValue(result.error)}`);
     lines.push('');
   }
 
   return lines.join('\n');
+}
+
+function summarizeValidation(records) {
+  const statusCounts = {};
+  const uniqueResolvedUrls = new Set();
+  let validationReadyRecordCount = 0;
+  let notApplicableRecordCount = 0;
+
+  for (const record of records) {
+    const status = record.urlValidationStatus || 'unvalidated';
+    statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+    if (status === 'not_applicable') {
+      notApplicableRecordCount += 1;
+    } else {
+      validationReadyRecordCount += 1;
+    }
+
+    if (record.resolvedUrl) {
+      uniqueResolvedUrls.add(record.resolvedUrl);
+    }
+  }
+
+  return {
+    totalRecords: records.length,
+    uniqueResolvedUrlCount: uniqueResolvedUrls.size,
+    validationReadyRecordCount,
+    notApplicableRecordCount,
+    statusCounts: Object.fromEntries(Object.entries(statusCounts).sort(([a], [b]) => a.localeCompare(b))),
+  };
 }
 
 function formatValue(value) {
@@ -519,15 +1018,6 @@ function getDomainFromReportPathOrContent(reportPath, markdown) {
   }
 
   throw new Error('Could not determine domain from report path or content.');
-}
-
-function isValidAbsoluteHttpUrl(value) {
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-  } catch {
-    return false;
-  }
 }
 
 async function runWithConcurrency(items, concurrency, worker) {
