@@ -15,7 +15,7 @@ Sitemap-driven link extraction and validation utility.
 - Reuses validation results for duplicate resolved URLs so the same target is not fetched repeatedly
 - Resolves `/` and other root-relative URLs against the sitemap domain
 - Marks non-web schemes such as `mailto:`, `tel:`, `javascript:`, `sms:`, `data:`, and fragment-only URLs as `not_applicable`
-- Logs suspicious anchor tags and fetch failures in separate report sections
+- Logs suspicious anchor tags and network failures in separate report sections
 
 ## Install
 
@@ -51,7 +51,7 @@ The generated extraction markdown file contains:
    - `HTTP Status`
    - `Validation Notes`
 5. A `Faulty Tags` section with one record per issue
-6. A `Fetch Errors` section with one record per failed page
+6. A `Network Errors` section with one record per failed page fetch or link-validation request
 
 
 ## Validation statuses

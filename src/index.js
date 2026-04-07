@@ -7,7 +7,7 @@ import { XMLParser } from 'fast-xml-parser';
 import * as cheerio from 'cheerio';
 
 const DEFAULT_CONCURRENCY = 1;
-const USER_AGENT = 'link-validator/1.0 (+https://piquant.ie)';
+const USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 link-validator/1.0 (+https://piquant.ie)';
 const SOFT_404_PATTERNS = [
   /\b404\b/i,
   /page not found/i,
@@ -84,7 +84,7 @@ async function main() {
   });
 
   console.log(`Validating ${records.length} extracted link record(s)...`);
-  await validateRecords(records, sitemapUrl, concurrency);
+  const validationFetchErrors = await validateRecords(records, sitemapUrl, concurrency);
 
   const markdown = buildMarkdownReport({
     generatedAt: new Date().toISOString(),
@@ -93,7 +93,7 @@ async function main() {
     uniqueLinkCount: records.length,
     records,
     faultyTags,
-    fetchErrors,
+    fetchErrors: [...fetchErrors, ...validationFetchErrors],
   });
 
   await writeFile(outputFile, markdown, 'utf8');
@@ -217,11 +217,14 @@ async function fetchText(url) {
 }
 
 async function fetchValidationDetails(url) {
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: 'GET',
     headers: {
       'user-agent': USER_AGENT,
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7',
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.9,text/plain;q=0.8,*/*;q=0.7',
+      'accept-language': 'en-US,en;q=0.9',
+      'cache-control': 'no-cache',
+      'pragma': 'no-cache',
     },
     redirect: 'follow',
   });
@@ -345,6 +348,8 @@ async function validateRecords(records, sitemapUrl, concurrency) {
     cache.set(resolvedUrl, result);
   });
 
+  const validationFetchErrors = [];
+
   for (const item of prepared) {
     const result = item.preValidationResult || cache.get(item.resolvedUrl) || {
       resolvedUrl: item.resolvedUrl,
@@ -359,7 +364,16 @@ async function validateRecords(records, sitemapUrl, concurrency) {
     item.record.finalUrl = result.finalUrl;
     item.record.httpStatus = result.httpStatus;
     item.record.validationNotes = result.validationNotes;
+
+    if (['connection_error', 'timeout', 'dns_error'].includes(result.urlValidationStatus)) {
+      validationFetchErrors.push({
+        pageUrl: result.resolvedUrl || item.normalizedInputUrl || item.record.parentUrl,
+        error: result.validationNotes || result.urlValidationStatus,
+      });
+    }
   }
+
+  return validationFetchErrors;
 }
 
 function prepareValidationTarget(rawUrl, sitemapUrl) {
@@ -441,7 +455,7 @@ async function validateResolvedUrl(resolvedUrl) {
       urlValidationStatus: classifyNetworkError(error),
       finalUrl: '',
       httpStatus: '',
-      validationNotes: error instanceof Error ? error.message : String(error),
+      validationNotes: describeError(error),
     };
   }
 }
@@ -543,17 +557,67 @@ function resolveCandidateUrl(value, sitemapUrl) {
 }
 
 function classifyNetworkError(error) {
-  const message = error instanceof Error ? error.message : String(error);
+  const details = describeError(error);
+  const message = details.toLowerCase();
 
-  if (/timed? out/i.test(message)) {
+  if (/timed? out|etimedout|headers timeout|body timeout|abort/i.test(message)) {
     return 'timeout';
   }
 
-  if (/ENOTFOUND|DNS|domain name/i.test(message)) {
+  if (/enotfound|eai_again|dns|domain name/i.test(message)) {
     return 'dns_error';
   }
 
   return 'connection_error';
+}
+
+function describeError(error) {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const parts = [error.message];
+
+  if ('code' in error && error.code) {
+    parts.push(`code=${error.code}`);
+  }
+
+  if (error.cause && error.cause !== error) {
+    if (typeof error.cause === 'object' && error.cause !== null) {
+      if ('code' in error.cause && error.cause.code) {
+        parts.push(`cause.code=${error.cause.code}`);
+      }
+      if ('message' in error.cause && error.cause.message) {
+        parts.push(`cause=${error.cause.message}`);
+      }
+    } else {
+      parts.push(`cause=${String(error.cause)}`);
+    }
+  }
+
+  return parts.filter(Boolean).join('; ');
+}
+
+function shouldRetryFetch(error) {
+  const details = describeError(error).toLowerCase();
+  return /econnreset|etimedout|eai_again|socket|other side closed|und_err|terminated|network/i.test(details);
+}
+
+async function fetchWithRetry(url, options, retries = 1) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetch(url, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries || !shouldRetryFetch(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 function buildMarkdownReport({ generatedAt, sitemapUrl, pageCount, uniqueLinkCount, records, faultyTags, fetchErrors }) {
@@ -570,7 +634,7 @@ function buildMarkdownReport({ generatedAt, sitemapUrl, pageCount, uniqueLinkCou
   lines.push(`- Validation-ready records: ${validationSummary.validationReadyRecordCount}`);
   lines.push(`- Not applicable records: ${validationSummary.notApplicableRecordCount}`);
   lines.push(`- Faulty tag candidates: ${faultyTags.length}`);
-  lines.push(`- Fetch errors: ${fetchErrors.length}`);
+  lines.push(`- Network errors: ${fetchErrors.length}`);
   lines.push('');
   lines.push('## Validation Summary');
   lines.push('');
@@ -632,14 +696,14 @@ function buildMarkdownReport({ generatedAt, sitemapUrl, pageCount, uniqueLinkCou
     }
   }
 
-  lines.push('## Fetch Errors');
+  lines.push('## Network Errors');
   lines.push('');
 
   if (!fetchErrors.length) {
-    lines.push('_No fetch errors._');
+    lines.push('_No network errors._');
   } else {
     for (const [index, error] of fetchErrors.entries()) {
-      lines.push(`### Fetch Error ${index + 1}`);
+      lines.push(`### Network Error ${index + 1}`);
       lines.push('');
       lines.push(`- Parent URL: ${formatValue(error.pageUrl)}`);
       lines.push(`- Error: ${formatValue(error.error)}`);
