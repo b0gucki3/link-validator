@@ -47,23 +47,25 @@ Optional flags:
 
 The generated extraction markdown file contains:
 
-1. A top-level validation summary with counts by status and unique resolved URLs checked
-2. A `Link Data` section with one record per link
-3. Per-link validation fields:
+1. Report metadata, including when the report was generated
+2. A top-level validation summary with counts by status and unique resolved URLs checked
+3. A `Link Data` section with one record per link
+4. Per-link validation fields:
    - `Resolved URL`
    - `URL Validation Status`
    - `Final URL`
    - `HTTP Status`
    - `Validation Notes`
-4. A `Faulty Tags` section with one record per issue
-5. A `Fetch Errors` section with one record per failed page
+5. A `Faulty Tags` section with one record per issue
+6. A `Fetch Errors` section with one record per failed page
 
 The generated validation markdown file contains:
 
-1. One validation record per unique absolute HTTP(S) URL
-2. HTTP status and status text
-3. Final URL after redirects
-4. Any fetch error if the validation request failed
+1. Report metadata, including when the validation results were generated
+2. One validation record per unique absolute HTTP(S) URL
+3. HTTP status and status text
+4. Final URL after redirects
+5. Any fetch error if the validation request failed
 
 ## Validation statuses
 

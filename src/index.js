@@ -38,7 +38,10 @@ async function main() {
     const inputFile = resolve(process.cwd(), args.validateFrom);
     const report = await runValidationFromReport(inputFile, concurrency);
     const outputFile = resolve(outDir, `${report.domain}-data-validation-results.md`);
-    await writeFile(outputFile, buildValidationMarkdownReport(report), 'utf8');
+    await writeFile(outputFile, buildValidationMarkdownReport({
+      ...report,
+      generatedAt: new Date().toISOString(),
+    }), 'utf8');
     console.log(`Done. Wrote validation results for ${report.uniqueUrlCount} unique URL(s) to ${outputFile}`);
     return;
   }
@@ -96,6 +99,7 @@ async function main() {
   await validateRecords(records, sitemapUrl, concurrency);
 
   const markdown = buildMarkdownReport({
+    generatedAt: new Date().toISOString(),
     sitemapUrl,
     pageCount: pageUrls.length,
     uniqueLinkCount: records.length,
@@ -592,6 +596,7 @@ async function runValidationFromReport(reportPath, concurrency) {
   }));
 
   await writeFile(reportPath, buildMarkdownReport({
+    generatedAt: new Date().toISOString(),
     sitemapUrl,
     pageCount: countPagesFromMarkdown(markdown),
     uniqueLinkCount: records.length,
@@ -835,12 +840,13 @@ function parseMarkdownValue(value) {
   return value === '_empty_' ? '' : value.replace(/<br>/g, '\n');
 }
 
-function buildMarkdownReport({ sitemapUrl, pageCount, uniqueLinkCount, records, faultyTags, fetchErrors }) {
+function buildMarkdownReport({ generatedAt, sitemapUrl, pageCount, uniqueLinkCount, records, faultyTags, fetchErrors }) {
   const lines = [];
   const validationSummary = summarizeValidation(records);
 
   lines.push(`# Link Extraction Report`);
   lines.push('');
+  lines.push(`- Report generated at: ${generatedAt || new Date().toISOString()}`);
   lines.push(`- Sitemap: ${sitemapUrl}`);
   lines.push(`- Pages processed: ${pageCount}`);
   lines.push(`- Unique links: ${uniqueLinkCount}`);
@@ -928,13 +934,14 @@ function buildMarkdownReport({ sitemapUrl, pageCount, uniqueLinkCount, records, 
   return lines.join('\n');
 }
 
-function buildValidationMarkdownReport({ domain, sourceReport, uniqueUrlCount, results }) {
+function buildValidationMarkdownReport({ domain, sourceReport, uniqueUrlCount, results, generatedAt }) {
   const lines = [];
   const okCount = results.filter((result) => result.ok).length;
   const failedCount = results.length - okCount;
 
   lines.push('# Link Validation Results');
   lines.push('');
+  lines.push(`- Report generated at: ${generatedAt || new Date().toISOString()}`);
   lines.push(`- Domain: ${domain}`);
   lines.push(`- Source report: ${sourceReport}`);
   lines.push(`- Unique URLs checked: ${uniqueUrlCount}`);
